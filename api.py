@@ -109,6 +109,10 @@ class BHYG(metaclass=ProtectedMeta):
             traces_sample_rate=1.0,
         )
         sentry_sdk.set_tag("machine_id", self.machine_id)
+        info = security.check_signature()
+        if info is None:
+            sys.exit(1)
+        print("Welcome, " + info.split("|")[0])
         self.last_order_time = 0
         self.last_order_check_time = 0
         self.voucher = ""
