@@ -2,7 +2,7 @@
 
 该版本为公开版本，将与主分支尽量保持同步。
 
-3 年过去，愿初心仍在。
+下载地址 https://dist.rakuyoudesu.com
 
 反馈群组 @bilibilihyg
 
