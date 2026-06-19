@@ -6,7 +6,6 @@ qrcode>=7.4.2
 questionary>=2.0.1
 cryptography>=41.0.5
 httpx[http2,brotli,zstd,socks]>=0.28.0
-sentry-sdk>=2.27.0
 Cython
 setuptools
 pyinstaller

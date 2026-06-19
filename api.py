@@ -16,9 +16,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes
 import questionary
-from sentry_sdk.scrubber import EventScrubber
-from sentry_sdk.integrations.loguru import LoguruIntegration, LoggingLevels
-import sentry_sdk
+import local_events as events
 
 from bilibili_util import BilibiliClient
 from loguru import logger
@@ -26,8 +24,7 @@ import security
 from push import do_push
 from typing import final
 
-POLICY_BASE = "https://not.available.in.oss.invalid"
-VERSION = "v1.13.1 OSS"
+VERSION = "v1.13.1"
 
 USE_CAPTCHA = False
 
@@ -53,7 +50,7 @@ class BHYG(metaclass=ProtectedMeta):
     def __init__(
         self
     ):
-        global POLICY_BASE, VERSION
+        global VERSION
         if sys.argv[0].endswith(".py"):
             self.DEBUG = True
         else:
@@ -83,7 +80,7 @@ class BHYG(metaclass=ProtectedMeta):
                 level="INFO",
                 format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <cyan>"
                 + self.machine_id[:7]
-                + "</cyan> | <magenta>OSS</magenta> | <level>{level: <8}</level> | <level>{message}</level>",
+                + "</cyan> | <magenta>本地版</magenta> | <level>{level: <8}</level> | <level>{message}</level>",
             )
         else:
             logger.add(
@@ -91,32 +88,15 @@ class BHYG(metaclass=ProtectedMeta):
                 level="DEBUG",
                 format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <cyan>"
                 + self.machine_id[:7]
-                + "</cyan> | <magenta>OSS调试模式</magenta> | <cyan>{function}</cyan> | <level>{level: <8}</level> | <level>{message}</level>",
+                + "</cyan> | <magenta>本地调试模式</magenta> | <cyan>{function}</cyan> | <level>{level: <8}</level> | <level>{message}</level>",
             )
             logger.success("Debug mode is ON")
         logger.info(f"Machine ID: {self.machine_id}")
-        sentry_loguru = LoguruIntegration(
-            level=LoggingLevels.DEBUG.value, event_level=LoggingLevels.CRITICAL.value
-        )
-        sentry_sdk.init(
-            dsn="https://da1bda709a249bb7d7ccfbfda4be1c91@sentry-inc.rakuyoudesu.com/4",
-            release=VERSION,
-            environment="debug" if self.DEBUG else "production",
-            attach_stacktrace=True,
-            integrations=[sentry_loguru],
-            send_default_pii=True,
-            event_scrubber=EventScrubber(denylist=[], pii_denylist=[]),
-            traces_sample_rate=1.0,
-        )
-        sentry_sdk.set_tag("machine_id", self.machine_id)
-        info = security.check_signature()
-        if info is None:
-            sys.exit(1)
-        print("Welcome, " + info.split("|")[0])
+        logger.debug("本地构建：已跳过发行签名校验")
         self.last_order_time = 0
         self.last_order_check_time = 0
         self.voucher = ""
-        self.collect_qq_login_info()
+        self.qqids = []
         logger.info("Setting Up Simulated Environment")
         self.client = BilibiliClient()
         self.client.init_show_cookies()
@@ -149,9 +129,9 @@ class BHYG(metaclass=ProtectedMeta):
             is_login, data = self.client.check_login()
             if is_login:
                 logger.info(self.i18n("welcome_login").format(username=data["uname"]))
-                sentry_sdk.set_user({"id": data["mid"]})
+                events.set_user({"id": data["mid"]})
                 self.cred = self.client._cookies
-                sentry_sdk.capture_message(
+                events.capture_message(
                     "Logined",
                     level="info",
                 )
@@ -178,7 +158,7 @@ class BHYG(metaclass=ProtectedMeta):
         if uid is None:
             if on_start:
                 logger.info(self.i18n("exit"))
-                sentry_sdk.capture_message(
+                events.capture_message(
                     "Exit",
                     level="info",
                 )
@@ -241,21 +221,7 @@ class BHYG(metaclass=ProtectedMeta):
 
     def collect_qq_login_info(self):
         self.qqids = []
-        if sys.platform == "win32":
-            user_profile = os.environ["USERPROFILE"]
-            if os.path.exists(
-                f"{user_profile}\\Documents\\Tencent Files\\nt_qq\\global\\nt_data\\Login"
-            ):
-                # list files
-                files = os.listdir(
-                    f"{user_profile}\\Documents\\Tencent Files\\nt_qq\\global\\nt_data\\Login"
-                )
-                for file in files:
-                    self.qqids.append(file.split(".")[1])
-        logger.debug(self.qqids)
-        if len(self.qqids) != 0:
-            sentry_sdk.set_tag("qq", " ".join(self.qqids))
-
+        return
     def decrypt_aes(self, data: str) -> str:
         try:
             key = hashlib.md5(self.machine_id.encode()).hexdigest().encode()[:16]
@@ -296,7 +262,7 @@ class BHYG(metaclass=ProtectedMeta):
                 self.first_start = False
                 file_content = f.read()
                 data = json.loads(self.decrypt_aes(file_content))
-                sentry_sdk.set_context("config", data)
+                events.set_context("config", data)
                 logger.debug(f"Config content: {data}")
                 self.config = data
                 self.load_session()
@@ -312,7 +278,7 @@ class BHYG(metaclass=ProtectedMeta):
 
     def save_config(self):
         self.config["version"] = VERSION
-        sentry_sdk.set_context("config", self.config)
+        events.set_context("config", self.config)
         self.ensure_config_folder()
         self.save_session()
         try:
@@ -357,7 +323,7 @@ class BHYG(metaclass=ProtectedMeta):
                         self.i18n("session_decrypt_failed").format(error=e)
                     )
                     return
-                sentry_sdk.set_context(
+                events.set_context(
                     "session_token", dict(self.client.session.cookies)
                 )
         except Exception as e:
@@ -652,8 +618,6 @@ class BHYG(metaclass=ProtectedMeta):
                 return self.token, self.ptoken
         # use prepare
         return self.prepare_token()
-        # NOT AVAILABLE IN OSS
-        raise Exception("NOT AVAILABLE IN OSS")
 
     def prepare_token(self):
         # TODO: Use prepare API to generate token.
@@ -955,8 +919,8 @@ class BHYG(metaclass=ProtectedMeta):
             logger.debug(resp)
             if resp["code"] == 0:
                 logger.success(self.i18n("rush_bws_success"))
-                sentry_sdk.set_tag("bws_reserve_id", reserve_id)
-                sentry_sdk.capture_message(
+                events.set_tag("bws_reserve_id", reserve_id)
+                events.capture_message(
                     "Rush BWS Success",
                     level="info",
                 )
@@ -1186,7 +1150,6 @@ class BHYG(metaclass=ProtectedMeta):
         logger.debug(data)
         # TEST 429 BYPASS MARKER
         # TEST 412 BYPASS MARKER
-        # NOT AVAILABLE IN OSS
 
         if self.config.get("ip", None) is not None:
             resp = self.client.post(
@@ -1234,17 +1197,17 @@ class BHYG(metaclass=ProtectedMeta):
                 else {"push_actions": []}
             )
             logger.debug(f"Order ID: {order_id} Push Config: {push_config}")
-            sentry_sdk.set_tag("order_id", str(order_id))
-            sentry_sdk.set_tag("order_project_id", self.config["project_id"])
-            sentry_sdk.set_tag("order_screen_id", self.config["screen_id"])
-            sentry_sdk.set_tag("order_sku_id", self.config["sku_id"])
-            sentry_sdk.set_tag(
+            events.set_tag("order_id", str(order_id))
+            events.set_tag("order_project_id", self.config["project_id"])
+            events.set_tag("order_screen_id", self.config["screen_id"])
+            events.set_tag("order_sku_id", self.config["sku_id"])
+            events.set_tag(
                 "order_buyer_id",
                 " ".join([str(buyer["id"]) for buyer in self.config["id_buyer"]])
                 if self.config["id_bind"] == 1 or self.config["id_bind"] == 2
                 else self.config["buyer"],
             )
-            sentry_sdk.capture_message(f"Order Success", level="info")
+            events.capture_message(f"Order Success", level="info")
             buyers = ""
             if self.config["id_bind"] == 0:
                 buyers = self.config["buyer"]
@@ -1263,27 +1226,6 @@ class BHYG(metaclass=ProtectedMeta):
                     username=self.client.username,
                 )
             )
-            try:
-                self.client.post(
-                    f"https://report.rakuyoudesu.com/report",
-                    json={
-                        "app": "bhyg",
-                        "version": VERSION,
-                        "type": "ordered",
-                        "data": {
-                            "id": self.client.uid,
-                            "order_id": order_id,
-                            "sku_id": self.config["sku_id"],
-                            "screen_id": self.config["sku_id"],
-                            "project_id": self.config["project_id"],
-                            "username": self.client.username,
-                            "machine_id": self.machine_id,
-                            "buyers": buyers,
-                        },
-                    },
-                )
-            except:
-                pass
             if len(push_config["push_actions"]) > 0:
                 # img to base64
                 import base64
@@ -1565,61 +1507,12 @@ class BHYG(metaclass=ProtectedMeta):
                     time.sleep(self.config.get("order_interval", 0.3))
 
     def check_follow(self, run_follow=True):
-        resp = self.client.get("https://api.bilibili.com/x/relation?fid=531718444")
         self.follow = {
             "followed": False,
             "be_followed": False,
             "followed_time": 0,
         }
-        if resp["code"] == 0:
-            self.follow["followed"] = (
-                True
-                if resp["data"]["attribute"] == 2 or resp["data"]["attribute"] == 6 or self.client.uid == 531718444
-                else False
-            )
-            self.follow["be_followed"] = (
-                True if resp["data"]["attribute"] == 6 else False
-            )
-            self.follow["followed_time"] = resp["data"]["mtime"]
-        if self.follow["followed"]:
-            if (
-                int(time.time()) - self.follow["followed_time"] > 60 * 60 * 24 * 30 * 6
-                or self.follow["be_followed"]
-            ):
-                logger.success(self.i18n("old_follower"))
-        else:
-            logger.warning(self.i18n("not_followed"))
-            if not run_follow:
-                return
-            resp = self.client.post(
-                "https://api.bilibili.com/x/relation/modify",
-                data={
-                    "fid": 531718444,
-                    "act": 1,
-                    "re_src": 11,
-                    "csrf": self.client.get_csrf(),
-                },
-            )
-            if resp["code"] == 0:
-                logger.success(self.i18n("follow_success"))
-                resp = self.client.get(
-                    "https://api.bilibili.com/x/relation?fid=531718444"
-                )
-                if resp["code"] == 0:
-                    self.follow["followed"] = (
-                        True
-                        if resp["data"]["attribute"] == 2
-                        or resp["data"]["attribute"] == 6
-                        else False
-                    )
-                    self.follow["be_followed"] = (
-                        True if resp["data"]["attribute"] == 6 else False
-                    )
-                    self.follow["followed_time"] = resp["data"]["mtime"]
-            else:
-                logger.debug(resp)
-                logger.error(self.i18n("follow_failed").format(message=resp["message"]))
-
+        return
     def set_ip(self):
         ip = questionary.text(self.i18n("ip_input")).ask()
         if ip == "" or ip is None:
@@ -1800,7 +1693,7 @@ class BHYG(metaclass=ProtectedMeta):
                         )
                     )
                 )
-                sentry_sdk.set_tag(
+                events.set_tag(
                     "current_zone", resp.headers["X-Cache-Webcdn"].split("blzone")[1]
                 )
             elif "Via" in resp.headers:
@@ -1809,14 +1702,14 @@ class BHYG(metaclass=ProtectedMeta):
                         current_zone=self.i18n("aliyun")
                     )
                 )
-                sentry_sdk.set_tag("current_zone", "aliyun")
+                events.set_tag("current_zone", "aliyun")
             else:
                 info_msg_lines.append(
                     self.i18n("cc_current_zone").format(
                         current_zone=self.i18n("unknown")
                     )
                 )
-                sentry_sdk.set_tag("current_zone", "unknown")
+                events.set_tag("current_zone", "unknown")
         except Exception as e:
             logger.debug(f"get current zone failed: {e}")
             info_msg_lines.append(

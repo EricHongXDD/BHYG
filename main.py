@@ -7,7 +7,7 @@ import os
 import atexit
 import qrcode
 import questionary
-import sentry_sdk
+import local_events as events
 from loguru import logger
 
 from api import BHYG
@@ -39,11 +39,11 @@ def is_terminal_available():
 
 def exit_handler():
     logger.info("Exiting...")
-    sentry_sdk.capture_message(
+    events.capture_message(
         "Exit",
         level="info",
     )
-    sentry_sdk.flush()
+    events.flush()
     import time
 
     logger.info("Wait 10s to exit...")
@@ -84,7 +84,7 @@ def select_ticket():
         )
         return
     client.config["project_id"] = int(project_id)
-    sentry_sdk.set_tag("project_id", project_id)
+    events.set_tag("project_id", project_id)
     logger.info(client.i18n("project_name").format(name=resp["data"]["name"]))
     ticket_name = f"{resp['data']['name']} "
     client.config["hotProject"] = resp["data"].get("hotProject", False)
@@ -438,7 +438,7 @@ def main():
     client = BHYG()
 
     while True:
-        sentry_sdk.capture_message(
+        events.capture_message(
             "Entered Main Menu",
             level="info",
         )
@@ -559,7 +559,7 @@ def main():
                         push_config["push_actions"].append("gotify")
                         gotify_config = {}
                         default_token = ""
-                        default_server = "https://gotify.rakuyoudesu.com"
+                        default_server = ""
                         if "push_config" in client.config:
                             if "gotify" in client.config["push_config"]:
                                 if "token" in client.config["push_config"]["gotify"]:
@@ -918,7 +918,7 @@ def main():
                                     )
                         except Exception as e:
                             logger.exception(e)
-                            track = sentry_sdk.capture_exception(e)
+                            track = events.capture_exception(e)
                             logger.error(
                                 client.i18n("error_occurred").format(trace=track)
                             )
@@ -1021,7 +1021,7 @@ def main():
                         logger.error(client.i18n("clean_cache_failed").format(error=e))
                 elif action == None or action == client.i18n("exit"):
                     logger.info(client.i18n("exit"))
-                    sentry_sdk.capture_message(
+                    events.capture_message(
                         "Exit",
                         level="info",
                     )
@@ -1036,6 +1036,6 @@ def main():
                 raise
         except Exception as e:
             logger.exception(e)
-            track = sentry_sdk.capture_exception(e)
+            track = events.capture_exception(e)
             logger.error(client.i18n("error_occurred").format(trace=track))
             continue

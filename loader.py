@@ -12,7 +12,6 @@ import qrcode
 import questionary
 import cryptography
 import httpx
-import sentry_sdk
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -33,9 +32,6 @@ import playsound3
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from sentry_sdk.scrubber import EventScrubber
-from sentry_sdk.integrations.loguru import LoguruIntegration, LoggingLevels
-import sentry_sdk
 from bilibili_util import BilibiliClient
 
 if __name__ == "__main__":
