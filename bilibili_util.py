@@ -9,6 +9,7 @@ import random
 import qrcode
 import hashlib
 import warnings
+import socket
 
 from functools import reduce
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
@@ -16,6 +17,52 @@ from typing import Optional, Tuple
 from loguru import logger
 
 class BilibiliClient:
+
+    SHOW_REQUEST_HOST = "show.bilibili.com"
+    # 候选池来自 show.bilibili.com A 记录抽样，优先使用直连 createV2 返回 405 的 IP。
+    SHOW_REQUEST_VALIDATED_IPS = (
+        "183.131.147.29",
+        "61.147.236.103",
+        "175.4.62.127",
+        "117.21.179.20",
+        "114.230.222.172",
+        "116.207.163.63",
+        "164.52.1.59",
+    )
+    SHOW_REQUEST_CANDIDATE_IPS = (
+        "183.131.147.27",
+        "183.131.147.28",
+        "183.131.147.29",
+        "183.131.147.30",
+        "183.131.147.48",
+        "61.147.236.101",
+        "61.147.236.102",
+        "61.147.236.103",
+        "61.147.236.104",
+        "175.4.62.127",
+        "175.4.62.128",
+        "175.4.62.129",
+        "117.21.179.18",
+        "117.21.179.19",
+        "117.21.179.20",
+        "114.230.222.138",
+        "114.230.222.139",
+        "114.230.222.140",
+        "114.230.222.141",
+        "114.230.222.142",
+        "114.230.222.172",
+        "114.230.222.173",
+        "116.207.163.63",
+        "116.207.163.64",
+        "116.207.163.65",
+        "116.207.163.66",
+        "164.52.1.59",
+        "164.52.1.60",
+        "164.52.1.61",
+        "164.52.1.62",
+        "103.151.151.133",
+        "103.151.151.134",
+    )
 
     def __init__(self):
         self.uid = 0
@@ -35,6 +82,8 @@ class BilibiliClient:
         self.app_sign = False
         self.rate_limit_events = []
         self.last_cdn_info = {"provider": "unknown", "zone": "unknown", "raw": ""}
+        self._request_ip_pool = []
+        self._current_request_ip = None
         self._get_newest_version()
         self.ua = self._gen_ua()
         self.headers = {
@@ -313,12 +362,72 @@ class BilibiliClient:
                 classification = "多接口分散限流，CDN zone 信息不足"
         return {"window_seconds": window_seconds, "recent_total": total, "endpoint_counts": endpoint_counts, "zone_counts": zone_counts, "path_zone_counts": path_zone_counts, "provider_counts": provider_counts, "classification": classification}
 
-    def a(self, record: dict = None):
-        # QA 本地测试钩子：遇到 429 时只打印，不做重试或网络操作。
-        if record:
-            print("QA 429 hook: {} {}".format(record.get("method", ""), record.get("endpoint", "")), flush=True)
+    def _split_request_ips(self, ip):
+        if ip is None:
+            return []
+        if isinstance(ip, (list, tuple, set)):
+            raw_items = ip
         else:
-            print("QA 429 hook", flush=True)
+            raw_items = str(ip).replace(";", ",").replace("\n", ",").split(",")
+        return [str(item).strip() for item in raw_items if str(item).strip()]
+
+    def _extend_request_ip_pool(self, ips):
+        if not hasattr(self, "_request_ip_pool"):
+            self._request_ip_pool = []
+        for ip in ips:
+            if ip not in self._request_ip_pool:
+                self._request_ip_pool.append(ip)
+
+    def _resolve_request_ips(self, hostname: str):
+        if not hostname:
+            return []
+        try:
+            infos = socket.getaddrinfo(hostname, 443, socket.AF_INET, socket.SOCK_STREAM)
+        except Exception as e:
+            logger.warning(f"解析请求 IP 失败: host={hostname} error={e}")
+            return []
+        ips = []
+        for info in infos:
+            ip = info[4][0]
+            if ip not in ips:
+                ips.append(ip)
+        return ips
+
+    def _seed_show_request_ip_pool(self):
+        self._extend_request_ip_pool(self.SHOW_REQUEST_VALIDATED_IPS)
+        self._extend_request_ip_pool(self.SHOW_REQUEST_CANDIDATE_IPS)
+        self._extend_request_ip_pool(self._resolve_request_ips(self.SHOW_REQUEST_HOST))
+
+    def _pick_show_request_ip(self, current_ip: str = None):
+        self._seed_show_request_ip_pool()
+        preferred = [ip for ip in self.SHOW_REQUEST_VALIDATED_IPS if ip != current_ip and ip in self._request_ip_pool]
+        candidates = preferred or [ip for ip in self._request_ip_pool if ip != current_ip]
+        if not candidates:
+            return None
+        return random.choice(candidates)
+
+    def a(self, record: dict = None):
+        record = record or {}
+        hostname = record.get("host_header")
+        if not hostname:
+            hostname = urlparse(str(record.get("logical_url", ""))).hostname
+        if not hostname and record.get("endpoint"):
+            hostname = str(record["endpoint"]).split("/", 1)[0]
+
+        if hostname != self.SHOW_REQUEST_HOST:
+            logger.debug("429 不切换请求 IP: host={} 不是 {}".format(hostname or "unknown", self.SHOW_REQUEST_HOST))
+            return None
+
+        current_ip = record.get("custom_ip") or getattr(self, "_current_request_ip", None)
+        self._extend_request_ip_pool(self._split_request_ips(current_ip))
+        next_ip = self._pick_show_request_ip(current_ip)
+        if not next_ip:
+            logger.warning("429 后未找到可切换的请求 IP: host={} current_ip={}".format(hostname, current_ip or "未设置"))
+            return None
+
+        self._current_request_ip = next_ip
+        logger.warning("429 后切换请求 IP: host={} {} -> {}".format(hostname, current_ip or "未设置", next_ip))
+        return next_ip
 
     def _record_rate_limit(self, method: str, logical_url: str, response: httpx.Response, actual_url: str = None, custom_ip: str = None, host_header: str = None):
         try:
@@ -719,17 +828,18 @@ class BilibiliClient:
         actual_url = url
         custom_ip = None
         host_header = None
+        configured_ip = kwargs.pop("ip", None)
+        self._extend_request_ip_pool(self._split_request_ips(configured_ip))
+        if getattr(self, "_current_request_ip", None) is None and self._request_ip_pool:
+            self._current_request_ip = self._request_ip_pool[0]
         try:
-            if "ip" in kwargs and "createV2" in url:
-                from urllib.parse import urlparse
+            if "createV2" in url and getattr(self, "_current_request_ip", None):
                 hostname = urlparse(url).hostname
-                custom_ip = kwargs["ip"]
+                custom_ip = self._current_request_ip
                 host_header = hostname
                 url = url.replace(hostname, custom_ip)
                 actual_url = url
-                kwargs.pop("ip")
-                headers = kwargs.get("headers", {})
-                kwargs.pop("headers")
+                headers = kwargs.pop("headers", {}) or {}
                 headers["Host"] = hostname
                 headers = httpx.Headers(headers)
                 logger.debug(f"Request headers: {headers}")
