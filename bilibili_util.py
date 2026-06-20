@@ -313,6 +313,13 @@ class BilibiliClient:
                 classification = "多接口分散限流，CDN zone 信息不足"
         return {"window_seconds": window_seconds, "recent_total": total, "endpoint_counts": endpoint_counts, "zone_counts": zone_counts, "path_zone_counts": path_zone_counts, "provider_counts": provider_counts, "classification": classification}
 
+    def a(self, record: dict = None):
+        # QA 本地测试钩子：遇到 429 时只打印，不做重试或网络操作。
+        if record:
+            print("QA 429 hook: {} {}".format(record.get("method", ""), record.get("endpoint", "")), flush=True)
+        else:
+            print("QA 429 hook", flush=True)
+
     def _record_rate_limit(self, method: str, logical_url: str, response: httpx.Response, actual_url: str = None, custom_ip: str = None, host_header: str = None):
         try:
             response.read()
@@ -345,6 +352,7 @@ class BilibiliClient:
             "response_body_preview": response.text[:500],
             "summary": summary,
         }
+        self.a(record)
         logger.warning("429限流诊断: {} endpoint={} cdn={}/{} retry_after={}".format(summary["classification"], endpoint, cdn_info["provider"], cdn_info["zone"], record["retry_after"]))
         logger.debug("429限流诊断详情: " + json.dumps(record, ensure_ascii=False, sort_keys=True))
         try:
