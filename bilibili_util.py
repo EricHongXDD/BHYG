@@ -1,4 +1,6 @@
 import base64
+import json
+import os
 import hmac
 import time
 import uuid
@@ -9,7 +11,7 @@ import hashlib
 import warnings
 
 from functools import reduce
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from typing import Optional, Tuple
 from loguru import logger
 
@@ -31,6 +33,8 @@ class BilibiliClient:
         self.show_init = False
         self.wbi = False
         self.app_sign = False
+        self.rate_limit_events = []
+        self.last_cdn_info = {"provider": "unknown", "zone": "unknown", "raw": ""}
         self._get_newest_version()
         self.ua = self._gen_ua()
         self.headers = {
@@ -227,8 +231,121 @@ class BilibiliClient:
         pass
 
     def _on_response(self, response: httpx.Response):
-        pass
+        cdn_info = self._extract_cdn_info(response.headers)
+        if cdn_info["provider"] != "unknown":
+            self.last_cdn_info = cdn_info
 
+    def _safe_header_dict(self, headers) -> dict:
+        sensitive_headers = {"set-cookie", "cookie", "authorization", "proxy-authorization"}
+        result = {}
+        for key, value in headers.items():
+            result[key] = "<redacted>" if key.lower() in sensitive_headers else value
+        return result
+
+    def _redact_url(self, url: str) -> str:
+        sensitive_params = {"token", "ptoken", "ctoken", "csrf", "csrf_token", "bili_jct", "sessdata", "qrcode_key", "key", "access_key", "voucher", "challenge", "validate", "seccode", "code"}
+        try:
+            parsed = urlparse(str(url))
+            query = []
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+                query.append((key, "<redacted>" if key.lower() in sensitive_params else value))
+            return urlunparse(parsed._replace(query=urlencode(query)))
+        except Exception:
+            return str(url)
+
+    def _extract_cdn_info(self, headers) -> dict:
+        header_map = {key.lower(): value for key, value in headers.items()}
+        webcdn = header_map.get("x-cache-webcdn", "")
+        via = header_map.get("via", "")
+        server = header_map.get("server", "")
+        raw = webcdn or via or server
+        if webcdn:
+            marker = "blzone"
+            zone = webcdn
+            if marker in webcdn:
+                tail = webcdn.split(marker, 1)[1]
+                zone_suffix = []
+                for char in tail:
+                    if char.isalnum() or char in "-_":
+                        zone_suffix.append(char)
+                    else:
+                        break
+                if zone_suffix:
+                    zone = marker + "".join(zone_suffix)
+            return {"provider": "bilicdn", "zone": zone, "raw": webcdn}
+        if via:
+            return {"provider": "via", "zone": via, "raw": via}
+        if server:
+            return {"provider": "server", "zone": server, "raw": server}
+        return {"provider": "unknown", "zone": "unknown", "raw": raw}
+
+    def _rate_limit_summary(self) -> dict:
+        now = time.time()
+        window_seconds = 600
+        self.rate_limit_events = [event for event in self.rate_limit_events if now - event["timestamp"] <= window_seconds][-200:]
+        endpoint_counts = {}
+        zone_counts = {}
+        provider_counts = {}
+        for event in self.rate_limit_events:
+            endpoint_counts[event["endpoint"]] = endpoint_counts.get(event["endpoint"], 0) + 1
+            zone_counts[event["zone"]] = zone_counts.get(event["zone"], 0) + 1
+            provider_counts[event["provider"]] = provider_counts.get(event["provider"], 0) + 1
+        total = len(self.rate_limit_events)
+        classification = "样本不足，暂不能判断限流范围"
+        if total >= 3:
+            top_zone, top_zone_count = max(zone_counts.items(), key=lambda item: item[1])
+            top_endpoint, top_endpoint_count = max(endpoint_counts.items(), key=lambda item: item[1])
+            if top_zone != "unknown" and top_zone_count / total >= 0.7:
+                classification = "疑似特定 CDN zone 或网络路径集中限流"
+            elif top_endpoint_count / total >= 0.7 and len(zone_counts) > 1:
+                classification = "疑似接口级或全局限流"
+            elif top_endpoint_count / total >= 0.7:
+                classification = "疑似单接口限流，CDN zone 信息不足"
+            else:
+                classification = "多接口或多区域分散限流"
+        return {"window_seconds": window_seconds, "recent_total": total, "endpoint_counts": endpoint_counts, "zone_counts": zone_counts, "provider_counts": provider_counts, "classification": classification}
+
+    def _record_rate_limit(self, method: str, logical_url: str, response: httpx.Response, actual_url: str = None, custom_ip: str = None, host_header: str = None):
+        try:
+            response.read()
+        except Exception:
+            pass
+        actual_url = actual_url or str(response.request.url if response.request else logical_url)
+        parsed = urlparse(str(logical_url))
+        endpoint = f"{parsed.netloc}{parsed.path}"
+        cdn_info = self._extract_cdn_info(response.headers)
+        self.rate_limit_events.append({"timestamp": time.time(), "method": method, "endpoint": endpoint, "provider": cdn_info["provider"], "zone": cdn_info["zone"]})
+        summary = self._rate_limit_summary()
+        record = {
+            "event": "http_429_rate_limit",
+            "local_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "epoch_ms": int(time.time() * 1000),
+            "method": method,
+            "endpoint": endpoint,
+            "logical_url": self._redact_url(logical_url),
+            "actual_url": self._redact_url(actual_url),
+            "query_keys": [key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)],
+            "status_code": response.status_code,
+            "reason_phrase": response.reason_phrase,
+            "retry_after": response.headers.get("Retry-After"),
+            "cdn": cdn_info,
+            "last_known_cdn": self.last_cdn_info,
+            "custom_ip": custom_ip,
+            "host_header": host_header,
+            "http_version": response.http_version,
+            "response_headers": self._safe_header_dict(response.headers),
+            "response_body_preview": response.text[:500],
+            "summary": summary,
+        }
+        logger.warning("429限流诊断: {} endpoint={} cdn={}/{} retry_after={}".format(summary["classification"], endpoint, cdn_info["provider"], cdn_info["zone"], record["retry_after"]))
+        logger.debug("429限流诊断详情: " + json.dumps(record, ensure_ascii=False, sort_keys=True))
+        try:
+            os.makedirs("bhyg_logs", exist_ok=True)
+            file_name = time.strftime("429_diagnostics_%Y-%m-%d.jsonl", time.localtime())
+            with open(os.path.join("bhyg_logs", file_name), "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception as e:
+            logger.debug(f"429诊断日志写入失败: {e}")
     def _gen_risk_header(self):
         uid = self.uid
         buvid = self.buvid
@@ -547,6 +664,9 @@ class BilibiliClient:
             resp = self.session.get(url, **kwargs)
         except Exception as e:
             return {"code": -114514,"message": f"请求失败：{e}","data": None}
+        if resp.status_code == 429:
+            self._record_rate_limit("GET", url, resp)
+            return {"code": 429,"message": f"请求被限流：[{resp.status_code}]","data": None}
         if resp.status_code == 200:
             resp = resp.json()
             resp_content = {
@@ -578,11 +698,19 @@ class BilibiliClient:
             
 
     def post(self, url: str, **kwargs) -> httpx.Response:
+        return_raw = kwargs.pop("raw", False)
+        logical_url = url
+        actual_url = url
+        custom_ip = None
+        host_header = None
         try:
             if "ip" in kwargs and "createV2" in url:
                 from urllib.parse import urlparse
                 hostname = urlparse(url).hostname
-                url = url.replace(hostname, kwargs["ip"])
+                custom_ip = kwargs["ip"]
+                host_header = hostname
+                url = url.replace(hostname, custom_ip)
+                actual_url = url
                 kwargs.pop("ip")
                 headers = kwargs.get("headers", {})
                 kwargs.pop("headers")
@@ -595,7 +723,16 @@ class BilibiliClient:
                 resp = self.session.post(url, **kwargs)
         except Exception as e:
             return {"code": -114514,"message": f"请求失败：{e}","data": None}
-        if "raw" in locals():
+        if resp.status_code == 429:
+            self._record_rate_limit(
+                "POST",
+                logical_url,
+                resp,
+                actual_url=actual_url,
+                custom_ip=custom_ip,
+                host_header=host_header,
+            )
+        if return_raw:
             return resp
         if resp.status_code == 200:
             try:
