@@ -19,39 +19,34 @@ from loguru import logger
 class BilibiliClient:
 
     SHOW_REQUEST_HOST = "show.bilibili.com"
-    # 候选池来自 show.bilibili.com A 记录抽样，优先使用直连 createV2 返回 405 的 IP。
+    SHOW_REQUEST_PROBE_PATH = "/api/ticket/order/createV2"
+    SHOW_REQUEST_IP_PROBE_TIMEOUT = 2.0
+    SHOW_REQUEST_IP_PROBE_CACHE_TTL = 300
+    SHOW_REQUEST_IP_USABLE_STATUS_CODES = {200, 400, 401, 403, 405, 412, 429}
+    # 默认池来自 show.bilibili.com 多 DNS 源 A 记录，并已用直连 GET createV2 验证返回 405。
     SHOW_REQUEST_VALIDATED_IPS = (
         "183.131.147.29",
-        "61.147.236.103",
-        "175.4.62.127",
-        "117.21.179.20",
-        "114.230.222.172",
-        "116.207.163.63",
-        "164.52.1.59",
-    )
-    SHOW_REQUEST_CANDIDATE_IPS = (
-        "183.131.147.27",
         "183.131.147.28",
-        "183.131.147.29",
         "183.131.147.30",
+        "114.230.222.142",
+        "114.230.222.173",
+        "183.131.147.27",
+        "114.230.222.141",
+        "114.230.222.140",
+        "114.230.222.138",
+        "61.147.236.103",
+        "61.147.236.102",
         "183.131.147.48",
         "61.147.236.101",
-        "61.147.236.102",
-        "61.147.236.103",
+        "114.230.222.139",
+        "114.230.222.172",
+        "117.21.179.20",
         "61.147.236.104",
+        "117.21.179.19",
+        "117.21.179.18",
         "175.4.62.127",
         "175.4.62.128",
         "175.4.62.129",
-        "117.21.179.18",
-        "117.21.179.19",
-        "117.21.179.20",
-        "114.230.222.138",
-        "114.230.222.139",
-        "114.230.222.140",
-        "114.230.222.141",
-        "114.230.222.142",
-        "114.230.222.172",
-        "114.230.222.173",
         "116.207.163.63",
         "116.207.163.64",
         "116.207.163.65",
@@ -60,9 +55,8 @@ class BilibiliClient:
         "164.52.1.60",
         "164.52.1.61",
         "164.52.1.62",
-        "103.151.151.133",
-        "103.151.151.134",
     )
+    SHOW_REQUEST_CANDIDATE_IPS = SHOW_REQUEST_VALIDATED_IPS
 
     def __init__(self):
         self.uid = 0
@@ -84,6 +78,7 @@ class BilibiliClient:
         self.last_cdn_info = {"provider": "unknown", "zone": "unknown", "raw": ""}
         self._request_ip_pool = []
         self._current_request_ip = None
+        self._request_ip_probe_cache = {}
         self._get_newest_version()
         self.ua = self._gen_ua()
         self.headers = {
@@ -371,6 +366,13 @@ class BilibiliClient:
             raw_items = str(ip).replace(";", ",").replace("\n", ",").split(",")
         return [str(item).strip() for item in raw_items if str(item).strip()]
 
+    def _unique_request_ips(self, ips):
+        result = []
+        for ip in ips:
+            if ip and ip not in result:
+                result.append(ip)
+        return result
+
     def _extend_request_ip_pool(self, ips):
         if not hasattr(self, "_request_ip_pool"):
             self._request_ip_pool = []
@@ -393,18 +395,64 @@ class BilibiliClient:
                 ips.append(ip)
         return ips
 
+    def _get_request_ip_probe_cache(self):
+        if not hasattr(self, "_request_ip_probe_cache"):
+            self._request_ip_probe_cache = {}
+        return self._request_ip_probe_cache
+
+    def _probe_show_request_ip(self, ip: str):
+        cache = self._get_request_ip_probe_cache()
+        now = time.time()
+        cached = cache.get(ip)
+        if cached and now - cached.get("checked_at", 0) <= self.SHOW_REQUEST_IP_PROBE_CACHE_TTL:
+            return cached.get("usable", False)
+
+        url = f"https://{ip}{self.SHOW_REQUEST_PROBE_PATH}"
+        headers = {
+            "Host": self.SHOW_REQUEST_HOST,
+            "User-Agent": getattr(self, "ua", "Mozilla/5.0"),
+        }
+        status_code = None
+        error = None
+        try:
+            # 只用 GET 探测 createV2 路由是否可达，不发送下单 POST。
+            with httpx.Client(timeout=self.SHOW_REQUEST_IP_PROBE_TIMEOUT, http2=True, verify=False, trust_env=False) as client:
+                resp = client.get(url, headers=headers)
+                status_code = resp.status_code
+                try:
+                    resp.read()
+                except Exception:
+                    pass
+            usable = status_code in self.SHOW_REQUEST_IP_USABLE_STATUS_CODES
+        except Exception as e:
+            usable = False
+            error = str(e)
+
+        cache[ip] = {
+            "checked_at": now,
+            "usable": usable,
+            "status_code": status_code,
+            "error": error,
+        }
+        if usable:
+            logger.debug("请求 IP 探测可用: ip={} status={}".format(ip, status_code))
+        else:
+            logger.warning("请求 IP 探测不可用: ip={} status={} error={}".format(ip, status_code or "none", error or "none"))
+        return usable
+
     def _seed_show_request_ip_pool(self):
-        self._extend_request_ip_pool(self.SHOW_REQUEST_VALIDATED_IPS)
         self._extend_request_ip_pool(self.SHOW_REQUEST_CANDIDATE_IPS)
         self._extend_request_ip_pool(self._resolve_request_ips(self.SHOW_REQUEST_HOST))
 
-    def _pick_show_request_ip(self, current_ip: str = None):
+    def _pick_show_request_ip(self, current_ip: str = None, preferred_ips=None):
         self._seed_show_request_ip_pool()
-        preferred = [ip for ip in self.SHOW_REQUEST_VALIDATED_IPS if ip != current_ip and ip in self._request_ip_pool]
-        candidates = preferred or [ip for ip in self._request_ip_pool if ip != current_ip]
-        if not candidates:
-            return None
-        return random.choice(candidates)
+        preferred = self._unique_request_ips(self._split_request_ips(preferred_ips))
+        candidates = self._unique_request_ips(preferred + list(self.SHOW_REQUEST_VALIDATED_IPS) + self._request_ip_pool)
+        candidates = [ip for ip in candidates if ip != current_ip]
+        for ip in candidates:
+            if self._probe_show_request_ip(ip):
+                return ip
+        return None
 
     def a(self, record: dict = None):
         record = record or {}
@@ -422,7 +470,7 @@ class BilibiliClient:
         self._extend_request_ip_pool(self._split_request_ips(current_ip))
         next_ip = self._pick_show_request_ip(current_ip)
         if not next_ip:
-            logger.warning("429 后未找到可切换的请求 IP: host={} current_ip={}".format(hostname, current_ip or "未设置"))
+            logger.warning("429 后未找到可用的可切换请求 IP: host={} current_ip={}".format(hostname, current_ip or "未设置"))
             return None
 
         self._current_request_ip = next_ip
@@ -833,7 +881,14 @@ class BilibiliClient:
         if getattr(self, "_current_request_ip", None) is None and self._request_ip_pool:
             self._current_request_ip = self._request_ip_pool[0]
         try:
-            if "createV2" in url and getattr(self, "_current_request_ip", None):
+            if "createV2" in url and (configured_ip or getattr(self, "_current_request_ip", None)):
+                configured_ips = self._split_request_ips(configured_ip)
+                if not getattr(self, "_current_request_ip", None):
+                    self._current_request_ip = self._pick_show_request_ip(preferred_ips=configured_ips)
+                elif not self._probe_show_request_ip(self._current_request_ip):
+                    self._current_request_ip = self._pick_show_request_ip(self._current_request_ip, configured_ips)
+                if not self._current_request_ip:
+                    return {"code": -114514,"message": "没有可用的下单 IP","data": None}
                 hostname = urlparse(url).hostname
                 custom_ip = self._current_request_ip
                 host_header = hostname
