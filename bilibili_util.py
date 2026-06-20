@@ -286,24 +286,32 @@ class BilibiliClient:
         endpoint_counts = {}
         zone_counts = {}
         provider_counts = {}
+        path_zone_counts = {}
         for event in self.rate_limit_events:
             endpoint_counts[event["endpoint"]] = endpoint_counts.get(event["endpoint"], 0) + 1
             zone_counts[event["zone"]] = zone_counts.get(event["zone"], 0) + 1
             provider_counts[event["provider"]] = provider_counts.get(event["provider"], 0) + 1
+            if event["provider"] in {"bilicdn", "via"} and event["zone"] != "unknown":
+                path_zone_counts[event["zone"]] = path_zone_counts.get(event["zone"], 0) + 1
         total = len(self.rate_limit_events)
         classification = "样本不足，暂不能判断限流范围"
         if total >= 3:
-            top_zone, top_zone_count = max(zone_counts.items(), key=lambda item: item[1])
             top_endpoint, top_endpoint_count = max(endpoint_counts.items(), key=lambda item: item[1])
-            if top_zone != "unknown" and top_zone_count / total >= 0.7:
-                classification = "疑似特定 CDN zone 或网络路径集中限流"
-            elif top_endpoint_count / total >= 0.7 and len(zone_counts) > 1:
-                classification = "疑似接口级或全局限流"
+            if path_zone_counts:
+                top_path_zone, top_path_zone_count = max(path_zone_counts.items(), key=lambda item: item[1])
+                if top_path_zone_count / total >= 0.7:
+                    classification = "疑似特定 CDN zone 或网络路径集中限流"
+                elif top_endpoint_count / total >= 0.7 and len(path_zone_counts) > 1:
+                    classification = "疑似接口级或全局限流"
+                elif top_endpoint_count / total >= 0.7:
+                    classification = "疑似单接口限流，CDN zone 样本不足"
+                else:
+                    classification = "多接口或多区域分散限流"
             elif top_endpoint_count / total >= 0.7:
                 classification = "疑似单接口限流，CDN zone 信息不足"
             else:
-                classification = "多接口或多区域分散限流"
-        return {"window_seconds": window_seconds, "recent_total": total, "endpoint_counts": endpoint_counts, "zone_counts": zone_counts, "provider_counts": provider_counts, "classification": classification}
+                classification = "多接口分散限流，CDN zone 信息不足"
+        return {"window_seconds": window_seconds, "recent_total": total, "endpoint_counts": endpoint_counts, "zone_counts": zone_counts, "path_zone_counts": path_zone_counts, "provider_counts": provider_counts, "classification": classification}
 
     def _record_rate_limit(self, method: str, logical_url: str, response: httpx.Response, actual_url: str = None, custom_ip: str = None, host_header: str = None):
         try:
