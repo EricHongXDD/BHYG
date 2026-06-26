@@ -232,6 +232,7 @@ def select_ticket():
                     questionary.Choice(sales_date["date"]) for sales_date in sales_dates
                 ],
             ).ask()
+            client.config["sale_date"] = sale_date
             if not sale_date:
                 logger.info(client.i18n("canceled"))
                 return

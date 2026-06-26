@@ -10,6 +10,7 @@ import qrcode
 import hashlib
 import warnings
 import socket
+import http.cookiejar
 
 from functools import reduce
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
@@ -278,6 +279,7 @@ class BilibiliClient:
         cdn_info = self._extract_cdn_info(response.headers)
         if cdn_info["provider"] != "unknown":
             self.last_cdn_info = cdn_info
+        self.clean_cookie()
 
     def _safe_header_dict(self, headers) -> dict:
         sensitive_headers = {"set-cookie", "cookie", "authorization", "proxy-authorization"}
@@ -835,6 +837,7 @@ class BilibiliClient:
     def get(self, url: str, **kwargs) -> httpx.Response:
         try:
             resp = self.session.get(url, **kwargs)
+            self.clean_cookie()
         except Exception as e:
             return {"code": -114514,"message": f"请求失败：{e}","data": None}
         if resp.status_code == 429:
@@ -900,8 +903,10 @@ class BilibiliClient:
                 logger.debug(f"Request headers: {headers}")
                 logger.debug(f"Request url: {url}")
                 resp = self.session.post(url, headers=headers, **kwargs)
+                self.clean_cookie()
             else:
                 resp = self.session.post(url, **kwargs)
+                self.clean_cookie()
         except Exception as e:
             return {"code": -114514,"message": f"请求失败：{e}","data": None}
         if resp.status_code == 429:
@@ -958,19 +963,92 @@ class BilibiliClient:
                 }
             return resp_content
 
+    def _is_cookie_expired(self, cookie, now=None):
+        now = int(time.time()) if now is None else now
+        try:
+            return cookie.is_expired(now)
+        except Exception:
+            return cookie.expires is not None and cookie.expires <= now
+
+    def _prefer_cookie(self, current, candidate, now=None):
+        if current is None:
+            return True
+        if self._is_cookie_expired(candidate, now):
+            return False
+        if self._is_cookie_expired(current, now):
+            return True
+        if candidate.expires is not None and current.expires is None:
+            return True
+        if candidate.expires is None and current.expires is not None:
+            return False
+        if candidate.expires is not None and current.expires is not None:
+            return candidate.expires >= current.expires
+        return True
+
+    def clean_cookie(self):
+        if not getattr(self, "session", None):
+            return
+        now = int(time.time())
+        seen = {}
+        for cookie in self.session.cookies.jar:
+            if self._prefer_cookie(seen.get(cookie.name), cookie, now):
+                seen[cookie.name] = cookie
+        new_jar = http.cookiejar.CookieJar()
+        for cookie in seen.values():
+            if not self._is_cookie_expired(cookie, now):
+                new_jar.set_cookie(cookie)
+        self.session.cookies.jar = new_jar
+
+    def _cookie_allowed_for_save(self, cookie):
+        return cookie.domain in {".bilibili.com", "show.bilibili.com", ""}
+
+    def _dump_cookie(self, cookie):
+        return {
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain,
+            "path": cookie.path,
+            "expires": cookie.expires,
+            "secure": cookie.secure,
+            "rest": dict(getattr(cookie, "_rest", {}) or {}),
+        }
+
+    def _load_cookie(self, cookie_data):
+        domain = cookie_data.get("domain") or ""
+        path = cookie_data.get("path") or "/"
+        expires = cookie_data.get("expires")
+        if expires is not None and expires <= int(time.time()):
+            return None
+        return http.cookiejar.Cookie(
+            version=0,
+            name=cookie_data["name"],
+            value=cookie_data["value"],
+            port=None,
+            port_specified=False,
+            domain=domain,
+            domain_specified=bool(domain),
+            domain_initial_dot=domain.startswith("."),
+            path=path,
+            path_specified=bool(path),
+            secure=bool(cookie_data.get("secure", False)),
+            expires=expires,
+            discard=expires is None,
+            comment=None,
+            comment_url=None,
+            rest=cookie_data.get("rest") or {"HttpOnly": None},
+            rfc2109=False,
+        )
+
     def save(self):
         import pickle
         import base64
+        self.clean_cookie()
         self._headers = dict(self.session.headers)
-        self._cookies = {}
-        for i in list(self.session.cookies):
-            self._cookies[i] = self.session.cookies.get(i, domain=".bilibili.com")
-            if self._cookies[i] == None:
-                self._cookies[i] = self.session.cookies.get(i, domain="show.bilibili.com")
-            if self._cookies[i] == None:
-                self._cookies[i] = self.session.cookies.get(i, domain="")
-            if self._cookies[i] == None:
-                self._cookies.pop(i)
+        self._cookies = []
+        now = int(time.time())
+        for cookie in self.session.cookies.jar:
+            if self._cookie_allowed_for_save(cookie) and not self._is_cookie_expired(cookie, now):
+                self._cookies.append(self._dump_cookie(cookie))
         tmp_session = self.session
         self.session = None
         data = pickle.dumps(self)
@@ -994,6 +1072,19 @@ class BilibiliClient:
             },
             verify=False
         )
-        self.session.cookies.update(self._cookies)
+        saved_cookies = getattr(self, "_cookies", [])
+        if isinstance(saved_cookies, dict):
+            saved_cookies.pop("kfcTime", None)
+            self.session.cookies.update(saved_cookies)
+        else:
+            for cookie_data in saved_cookies:
+                try:
+                    cookie = self._load_cookie(cookie_data)
+                    if cookie is not None:
+                        self.session.cookies.jar.set_cookie(cookie)
+                except Exception as e:
+                    logger.warning(f"加载 cookie 失败: {cookie_data.get('name', 'unknown')} {e}")
+        self.clean_cookie()
         self._getKeys()
+        self.clean_cookie()
         return

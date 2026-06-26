@@ -95,6 +95,8 @@ class BHYG(metaclass=ProtectedMeta):
         logger.debug("本地构建：已跳过发行签名校验")
         self.last_order_time = 0
         self.last_order_check_time = 0
+        self.last_ticket_refresh_time = 0
+        self.last_ticket_refresh_attempt_time = 0
         self.voucher = ""
         self.qqids = []
         logger.info("Setting Up Simulated Environment")
@@ -567,6 +569,106 @@ class BHYG(metaclass=ProtectedMeta):
         ):
             return False
         return True
+
+    def _parse_sale_start_time(self, sale_start):
+        if not sale_start:
+            return 0
+        try:
+            return int(time.mktime(time.strptime(sale_start, "%Y-%m-%d %H:%M:%S")))
+        except (TypeError, ValueError):
+            logger.warning(self.i18n("sale_start_time_not_found"))
+            return 0
+
+    def _find_selected_screen_and_sku(self, screens):
+        screen_id = str(self.config.get("screen_id"))
+        sku_id = str(self.config.get("sku_id"))
+        for screen in screens or []:
+            if str(screen.get("id")) != screen_id:
+                continue
+            for sku in screen.get("ticket_list", []) or []:
+                if str(sku.get("id")) == sku_id:
+                    return screen, sku
+            return screen, None
+        return None, None
+
+    def refresh_selected_ticket_info(self, reason="before_sale", save=False):
+        if not self.check_select_sku_complete():
+            logger.warning(self.i18n("select_sku_not_complete"))
+            return False
+        project_id = self.config.get("project_id")
+        if not project_id:
+            return False
+
+        logger.info("刷新当前票务信息: {}".format(reason))
+        project_name = self.config.get("ticket_name", "").split(" ")[0]
+        screens = []
+        if self.config.get("is_changfan", False) and self.config.get("linkgood_id"):
+            resp = self.client.get(
+                f"https://show.bilibili.com/api/ticket/linkgoods/detail?link_id={self.config['linkgood_id']}"
+            )
+            if resp["code"] != 0:
+                logger.warning(self.i18n("get_changfan_failed").format(message=resp["message"]))
+                return False
+            data = resp.get("data") or {}
+            screens = data.get("specs_list", [])
+            project_name = (data.get("detail") or {}).get("name", project_name)
+        else:
+            resp = self.client.get(
+                "https://show.bilibili.com/api/ticket/project/getV2?version=134&id={}".format(project_id)
+            )
+            if resp["code"] != 0:
+                logger.warning(self.i18n("get_project_failed").format(message=resp["message"]))
+                return False
+            data = resp.get("data") or {}
+            self.config["hotProject"] = data.get("hotProject", self.config.get("hotProject", False))
+            self.config["project_buyer_info"] = data.get("buyer_info", self.config.get("project_buyer_info", ""))
+            self.config["id_bind"] = data.get("id_bind", self.config.get("id_bind"))
+            project_name = data.get("name", project_name)
+            screens = data.get("screen_list", [])
+            if data.get("project_type", 1) == 2 and self.config.get("sale_date"):
+                by_date = self.client.get(
+                    f"https://show.bilibili.com/api/ticket/project/infoByDate?id={project_id}&date={self.config['sale_date']}"
+                )
+                if by_date["code"] == 0:
+                    screens = (by_date.get("data") or {}).get("screen_list", screens)
+                else:
+                    logger.warning(self.i18n("get_project_failed").format(message=by_date["message"]))
+
+        screen, sku = self._find_selected_screen_and_sku(screens)
+        if not screen or not sku:
+            logger.warning("刷新票务信息失败: 未找到当前已选场次或票档")
+            return False
+
+        sale_start_time = self._parse_sale_start_time(sku.get("sale_start"))
+        if sale_start_time:
+            self.config["sale_start_time"] = sale_start_time
+        count = int(self.config.get("count", 1) or 1)
+        if sku.get("price") is not None:
+            self.config["pay_money"] = int(sku["price"]) * count
+        self.config["ticket_name"] = f"{project_name} {screen.get('name', '')} {sku.get('desc', '')}".strip()
+        self.last_ticket_refresh_time = time.time()
+        logger.info("票务信息已刷新: {}".format(self.config["ticket_name"]))
+        if save:
+            self.save_config()
+        return True
+
+    def maybe_refresh_ticket_before_sale(self):
+        sale_start_time = self.config.get("sale_start_time", 0) or 0
+        if sale_start_time <= 0:
+            return False
+        refresh_seconds = self.config.get("refresh_ticket_before_sale_seconds", 180)
+        now = time.time()
+        if sale_start_time <= now:
+            return False
+        if now - self.last_ticket_refresh_attempt_time < 30:
+            return False
+        if self.last_ticket_refresh_time and sale_start_time - self.last_ticket_refresh_time <= refresh_seconds:
+            return False
+        if sale_start_time - now <= refresh_seconds:
+            self.last_ticket_refresh_attempt_time = now
+            return self.refresh_selected_ticket_info(reason="before_sale", save=False)
+        return False
+
 
     def check_select_buyer_complete(self):
         if "id_bind" not in self.config:
@@ -1414,6 +1516,7 @@ class BHYG(metaclass=ProtectedMeta):
                     )
                 )
                 while self.config["sale_start_time"] - 5 > time.time():
+                    self.maybe_refresh_ticket_before_sale()
                     time.sleep(2)
                     logger.info(
                         self.i18n("wait_until_sale_start").format(
@@ -1422,6 +1525,7 @@ class BHYG(metaclass=ProtectedMeta):
                     )
                     continue
                 logger.info(self.i18n("ready_to_sale"))
+                self.maybe_refresh_ticket_before_sale()
                 prereq_resp = self.client.session.head("https://show.bilibili.com")
                 logger.debug(prereq_resp.headers)
                 while (
