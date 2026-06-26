@@ -26,6 +26,10 @@ from typing import final
 
 VERSION = "v1.13.1"
 
+BYPASS_412 = True
+BYPASS_429 = True
+KFC_TIME_WARMUP_SECONDS = 3600
+
 USE_CAPTCHA = False
 
 
@@ -97,6 +101,8 @@ class BHYG(metaclass=ProtectedMeta):
         self.last_order_check_time = 0
         self.last_ticket_refresh_time = 0
         self.last_ticket_refresh_attempt_time = 0
+        self.last_kfctime_warmup_time = 0
+        self.last_kfctime_warmup_attempt_time = 0
         self.voucher = ""
         self.qqids = []
         logger.info("Setting Up Simulated Environment")
@@ -669,6 +675,64 @@ class BHYG(metaclass=ProtectedMeta):
             return self.refresh_selected_ticket_info(reason="before_sale", save=False)
         return False
 
+    def warmup_kfctime_cookie(self, reason="before_sale"):
+        if not self.config.get("hotProject", False):
+            return False
+        project_id = self.config.get("project_id")
+        if not project_id:
+            return False
+
+        self.last_kfctime_warmup_attempt_time = time.time()
+        logger.info("预热 kfcTime cookie: {}".format(reason))
+        resp = self.client.post(
+            "https://mall.bilibili.com/mall-search-items/items_detail/info",
+            headers={
+                "origin": "https://mall.bilibili.com",
+                "referer": (
+                    "https://mall.bilibili.com/neul-next/ticket-renovation/detail.html"
+                    "?id={0}&from=pc_ticketlist&noTitleBar=1".format(project_id)
+                ),
+            },
+            json={
+                "itemsId": project_id,
+                "itemsDetailPageType": 3,
+            },
+        )
+        self.client.clean_cookie()
+        if resp["code"] != 0:
+            logger.warning("预热 kfcTime cookie 失败: {}".format(resp["message"]))
+            return False
+
+        now = int(time.time())
+        has_kfctime = any(
+            cookie.name == "kfcTime"
+            and (cookie.expires is None or cookie.expires > now)
+            for cookie in self.client.session.cookies.jar
+        )
+        if not has_kfctime:
+            logger.warning("预热未获取到 kfcTime cookie，可能会导致下单失败")
+            return False
+
+        self.last_kfctime_warmup_time = time.time()
+        logger.info("kfcTime cookie 已预热")
+        return True
+
+    def maybe_warmup_kfctime_before_sale(self):
+        sale_start_time = self.config.get("sale_start_time", 0) or 0
+        if sale_start_time <= 0:
+            return False
+        now = time.time()
+        warmup_seconds = self.config.get("kfctime_warmup_before_sale_seconds", KFC_TIME_WARMUP_SECONDS)
+        if sale_start_time > now and sale_start_time - now > warmup_seconds:
+            return False
+        if sale_start_time <= now and self.last_kfctime_warmup_attempt_time:
+            return False
+        if now - self.last_kfctime_warmup_attempt_time < 30:
+            return False
+        if self.last_kfctime_warmup_time and sale_start_time - self.last_kfctime_warmup_time <= warmup_seconds:
+            return False
+        return self.warmup_kfctime_cookie(reason="before_sale")
+
 
     def check_select_buyer_complete(self):
         if "id_bind" not in self.config:
@@ -1175,6 +1239,26 @@ class BHYG(metaclass=ProtectedMeta):
                 self.voucher = resp["data"]["new_voucher"]
                 return True
 
+    def _get_dede_user_id_cookie(self):
+        for cookie in self.client.session.cookies.jar:
+            if cookie.name == "DedeUserID":
+                return cookie.value
+        return self.client.uid
+
+    def _replace_dede_user_id_cookie(self, user_id):
+        # 按 cookie jar 精确清理，避免同名 DedeUserID 在不同域下残留。
+        for cookie in list(self.client.session.cookies.jar):
+            if cookie.name != "DedeUserID":
+                continue
+            try:
+                self.client.session.cookies.jar.clear(cookie.domain, cookie.path, cookie.name)
+            except KeyError:
+                pass
+        if user_id is not None:
+            self.client.session.cookies.set(
+                "DedeUserID", str(user_id), domain=".bilibili.com"
+            )
+
     def do_order_create(self):
         if not self.check_select_sku_complete():
             logger.error(self.i18n("select_sku_not_complete"))
@@ -1253,17 +1337,24 @@ class BHYG(metaclass=ProtectedMeta):
         # TEST 429 BYPASS MARKER
         # TEST 412 BYPASS MARKER
 
-        if self.config.get("ip", None) is not None:
-            resp = self.client.post(
-                f"{self.order_base}/api/ticket/order/createV2?project_id={self.config['project_id']}{'&ptoken=' + ptoken if self.config['hotProject'] else ''}",
-                ip=self.config["ip"],
-                json=data,
-            )
-        else:
-            resp = self.client.post(
-                f"{self.order_base}/api/ticket/order/createV2?project_id={self.config['project_id']}{'&ptoken=' + ptoken if self.config['hotProject'] else ''}",
-                json=data,
-            )
+        original_dede_user_id = self._get_dede_user_id_cookie()
+        if BYPASS_412:
+            self._replace_dede_user_id_cookie(random.randint(10000000, 99999999))
+        try:
+            if self.config.get("ip", None) is not None:
+                resp = self.client.post(
+                    f"{self.order_base}/api/ticket/order/createV2?project_id={self.config['project_id']}{'&ptoken=' + ptoken if self.config['hotProject'] else ''}",
+                    ip=self.config["ip"],
+                    json=data,
+                )
+            else:
+                resp = self.client.post(
+                    f"{self.order_base}/api/ticket/order/createV2?project_id={self.config['project_id']}{'&ptoken=' + ptoken if self.config['hotProject'] else ''}",
+                    json=data,
+                )
+        finally:
+            if BYPASS_412:
+                self._replace_dede_user_id_cookie(original_dede_user_id)
         logger.debug("Order create response:")
         logger.debug(resp)
         if resp["code"] == 0 and "defaultBBR" not in resp.get("message", ""):
@@ -1411,8 +1502,10 @@ class BHYG(metaclass=ProtectedMeta):
             resp["code"] in range(100000, 100100)
             or resp["code"] in range(200, 299)
             or resp["code"] in [900002, 3]
+            or resp["code"] == 429
         ):
-            self.last_order_check_time = time.time()
+            if resp["code"] != 429 or not BYPASS_429:
+                self.last_order_check_time = time.time()
         if resp["code"] in range(200, 299):
             self.last_order_time = time.time()
         return False
@@ -1509,6 +1602,7 @@ class BHYG(metaclass=ProtectedMeta):
         count = 0
         stock_check_count = 0
         while True:
+            self.maybe_warmup_kfctime_before_sale()
             if self.config["sale_start_time"] > time.time():
                 logger.info(
                     self.i18n("wait_until_sale_start").format(
@@ -1517,6 +1611,7 @@ class BHYG(metaclass=ProtectedMeta):
                 )
                 while self.config["sale_start_time"] - 5 > time.time():
                     self.maybe_refresh_ticket_before_sale()
+                    self.maybe_warmup_kfctime_before_sale()
                     time.sleep(2)
                     logger.info(
                         self.i18n("wait_until_sale_start").format(
@@ -1526,6 +1621,7 @@ class BHYG(metaclass=ProtectedMeta):
                     continue
                 logger.info(self.i18n("ready_to_sale"))
                 self.maybe_refresh_ticket_before_sale()
+                self.maybe_warmup_kfctime_before_sale()
                 prereq_resp = self.client.session.head("https://show.bilibili.com")
                 logger.debug(prereq_resp.headers)
                 while (
