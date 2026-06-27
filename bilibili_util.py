@@ -1,6 +1,4 @@
 import base64
-import json
-import os
 import hmac
 import time
 import uuid
@@ -9,56 +7,14 @@ import random
 import qrcode
 import hashlib
 import warnings
-import socket
 import http.cookiejar
 
 from functools import reduce
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.parse import quote, urlencode, urlparse
 from typing import Optional, Tuple
 from loguru import logger
 
 class BilibiliClient:
-
-    SHOW_REQUEST_HOST = "show.bilibili.com"
-    SHOW_REQUEST_PROBE_PATH = "/api/ticket/order/createV2"
-    SHOW_REQUEST_IP_PROBE_TIMEOUT = 2.0
-    SHOW_REQUEST_IP_PROBE_CACHE_TTL = 300
-    SHOW_REQUEST_IP_USABLE_STATUS_CODES = {200, 400, 401, 403, 405, 412, 429}
-    # 默认池来自 show.bilibili.com 多 DNS 源 A 记录，并已用直连 GET createV2 验证返回 405。
-    SHOW_REQUEST_VALIDATED_IPS = (
-        "183.131.147.29",
-        "183.131.147.28",
-        "183.131.147.30",
-        "114.230.222.142",
-        "114.230.222.173",
-        "183.131.147.27",
-        "114.230.222.141",
-        "114.230.222.140",
-        "114.230.222.138",
-        "61.147.236.103",
-        "61.147.236.102",
-        "183.131.147.48",
-        "61.147.236.101",
-        "114.230.222.139",
-        "114.230.222.172",
-        "117.21.179.20",
-        "61.147.236.104",
-        "117.21.179.19",
-        "117.21.179.18",
-        "175.4.62.127",
-        "175.4.62.128",
-        "175.4.62.129",
-        "116.207.163.63",
-        "116.207.163.64",
-        "116.207.163.65",
-        "116.207.163.66",
-        "164.52.1.59",
-        "164.52.1.60",
-        "164.52.1.61",
-        "164.52.1.62",
-    )
-    SHOW_REQUEST_CANDIDATE_IPS = SHOW_REQUEST_VALIDATED_IPS
-
     def __init__(self):
         self.uid = 0
         model_list = {
@@ -75,11 +31,6 @@ class BilibiliClient:
         self.show_init = False
         self.wbi = False
         self.app_sign = False
-        self.rate_limit_events = []
-        self.last_cdn_info = {"provider": "unknown", "zone": "unknown", "raw": ""}
-        self._request_ip_pool = []
-        self._current_request_ip = None
-        self._request_ip_probe_cache = {}
         self._get_newest_version()
         self.ua = self._gen_ua()
         self.headers = {
@@ -276,88 +227,7 @@ class BilibiliClient:
         pass
 
     def _on_response(self, response: httpx.Response):
-        cdn_info = self._extract_cdn_info(response.headers)
-        if cdn_info["provider"] != "unknown":
-            self.last_cdn_info = cdn_info
         self.clean_cookie()
-
-    def _safe_header_dict(self, headers) -> dict:
-        sensitive_headers = {"set-cookie", "cookie", "authorization", "proxy-authorization"}
-        result = {}
-        for key, value in headers.items():
-            result[key] = "<redacted>" if key.lower() in sensitive_headers else value
-        return result
-
-    def _redact_url(self, url: str) -> str:
-        sensitive_params = {"token", "ptoken", "ctoken", "csrf", "csrf_token", "bili_jct", "sessdata", "qrcode_key", "key", "access_key", "voucher", "challenge", "validate", "seccode", "code"}
-        try:
-            parsed = urlparse(str(url))
-            query = []
-            for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-                query.append((key, "<redacted>" if key.lower() in sensitive_params else value))
-            return urlunparse(parsed._replace(query=urlencode(query)))
-        except Exception:
-            return str(url)
-
-    def _extract_cdn_info(self, headers) -> dict:
-        header_map = {key.lower(): value for key, value in headers.items()}
-        webcdn = header_map.get("x-cache-webcdn", "")
-        via = header_map.get("via", "")
-        server = header_map.get("server", "")
-        raw = webcdn or via or server
-        if webcdn:
-            marker = "blzone"
-            zone = webcdn
-            if marker in webcdn:
-                tail = webcdn.split(marker, 1)[1]
-                zone_suffix = []
-                for char in tail:
-                    if char.isalnum() or char in "-_":
-                        zone_suffix.append(char)
-                    else:
-                        break
-                if zone_suffix:
-                    zone = marker + "".join(zone_suffix)
-            return {"provider": "bilicdn", "zone": zone, "raw": webcdn}
-        if via:
-            return {"provider": "via", "zone": via, "raw": via}
-        if server:
-            return {"provider": "server", "zone": server, "raw": server}
-        return {"provider": "unknown", "zone": "unknown", "raw": raw}
-
-    def _rate_limit_summary(self) -> dict:
-        now = time.time()
-        window_seconds = 600
-        self.rate_limit_events = [event for event in self.rate_limit_events if now - event["timestamp"] <= window_seconds][-200:]
-        endpoint_counts = {}
-        zone_counts = {}
-        provider_counts = {}
-        path_zone_counts = {}
-        for event in self.rate_limit_events:
-            endpoint_counts[event["endpoint"]] = endpoint_counts.get(event["endpoint"], 0) + 1
-            zone_counts[event["zone"]] = zone_counts.get(event["zone"], 0) + 1
-            provider_counts[event["provider"]] = provider_counts.get(event["provider"], 0) + 1
-            if event["provider"] in {"bilicdn", "via"} and event["zone"] != "unknown":
-                path_zone_counts[event["zone"]] = path_zone_counts.get(event["zone"], 0) + 1
-        total = len(self.rate_limit_events)
-        classification = "样本不足，暂不能判断限流范围"
-        if total >= 3:
-            top_endpoint, top_endpoint_count = max(endpoint_counts.items(), key=lambda item: item[1])
-            if path_zone_counts:
-                top_path_zone, top_path_zone_count = max(path_zone_counts.items(), key=lambda item: item[1])
-                if top_path_zone_count / total >= 0.7:
-                    classification = "疑似特定 CDN zone 或网络路径集中限流"
-                elif top_endpoint_count / total >= 0.7 and len(path_zone_counts) > 1:
-                    classification = "疑似接口级或全局限流"
-                elif top_endpoint_count / total >= 0.7:
-                    classification = "疑似单接口限流，CDN zone 样本不足"
-                else:
-                    classification = "多接口或多区域分散限流"
-            elif top_endpoint_count / total >= 0.7:
-                classification = "疑似单接口限流，CDN zone 信息不足"
-            else:
-                classification = "多接口分散限流，CDN zone 信息不足"
-        return {"window_seconds": window_seconds, "recent_total": total, "endpoint_counts": endpoint_counts, "zone_counts": zone_counts, "path_zone_counts": path_zone_counts, "provider_counts": provider_counts, "classification": classification}
 
     def _split_request_ips(self, ip):
         if ip is None:
@@ -367,160 +237,6 @@ class BilibiliClient:
         else:
             raw_items = str(ip).replace(";", ",").replace("\n", ",").split(",")
         return [str(item).strip() for item in raw_items if str(item).strip()]
-
-    def _unique_request_ips(self, ips):
-        result = []
-        for ip in ips:
-            if ip and ip not in result:
-                result.append(ip)
-        return result
-
-    def _extend_request_ip_pool(self, ips):
-        if not hasattr(self, "_request_ip_pool"):
-            self._request_ip_pool = []
-        for ip in ips:
-            if ip not in self._request_ip_pool:
-                self._request_ip_pool.append(ip)
-
-    def _resolve_request_ips(self, hostname: str):
-        if not hostname:
-            return []
-        try:
-            infos = socket.getaddrinfo(hostname, 443, socket.AF_INET, socket.SOCK_STREAM)
-        except Exception as e:
-            logger.warning(f"解析请求 IP 失败: host={hostname} error={e}")
-            return []
-        ips = []
-        for info in infos:
-            ip = info[4][0]
-            if ip not in ips:
-                ips.append(ip)
-        return ips
-
-    def _get_request_ip_probe_cache(self):
-        if not hasattr(self, "_request_ip_probe_cache"):
-            self._request_ip_probe_cache = {}
-        return self._request_ip_probe_cache
-
-    def _probe_show_request_ip(self, ip: str):
-        cache = self._get_request_ip_probe_cache()
-        now = time.time()
-        cached = cache.get(ip)
-        if cached and now - cached.get("checked_at", 0) <= self.SHOW_REQUEST_IP_PROBE_CACHE_TTL:
-            return cached.get("usable", False)
-
-        url = f"https://{ip}{self.SHOW_REQUEST_PROBE_PATH}"
-        headers = {
-            "Host": self.SHOW_REQUEST_HOST,
-            "User-Agent": getattr(self, "ua", "Mozilla/5.0"),
-        }
-        status_code = None
-        error = None
-        try:
-            # 只用 GET 探测 createV2 路由是否可达，不发送下单 POST。
-            with httpx.Client(timeout=self.SHOW_REQUEST_IP_PROBE_TIMEOUT, http2=True, verify=False, trust_env=False) as client:
-                resp = client.get(url, headers=headers)
-                status_code = resp.status_code
-                try:
-                    resp.read()
-                except Exception:
-                    pass
-            usable = status_code in self.SHOW_REQUEST_IP_USABLE_STATUS_CODES
-        except Exception as e:
-            usable = False
-            error = str(e)
-
-        cache[ip] = {
-            "checked_at": now,
-            "usable": usable,
-            "status_code": status_code,
-            "error": error,
-        }
-        if usable:
-            logger.debug("请求 IP 探测可用: ip={} status={}".format(ip, status_code))
-        else:
-            logger.warning("请求 IP 探测不可用: ip={} status={} error={}".format(ip, status_code or "none", error or "none"))
-        return usable
-
-    def _seed_show_request_ip_pool(self):
-        self._extend_request_ip_pool(self.SHOW_REQUEST_CANDIDATE_IPS)
-        self._extend_request_ip_pool(self._resolve_request_ips(self.SHOW_REQUEST_HOST))
-
-    def _pick_show_request_ip(self, current_ip: str = None, preferred_ips=None):
-        self._seed_show_request_ip_pool()
-        preferred = self._unique_request_ips(self._split_request_ips(preferred_ips))
-        candidates = self._unique_request_ips(preferred + list(self.SHOW_REQUEST_VALIDATED_IPS) + self._request_ip_pool)
-        candidates = [ip for ip in candidates if ip != current_ip]
-        for ip in candidates:
-            if self._probe_show_request_ip(ip):
-                return ip
-        return None
-
-    def a(self, record: dict = None):
-        record = record or {}
-        hostname = record.get("host_header")
-        if not hostname:
-            hostname = urlparse(str(record.get("logical_url", ""))).hostname
-        if not hostname and record.get("endpoint"):
-            hostname = str(record["endpoint"]).split("/", 1)[0]
-
-        if hostname != self.SHOW_REQUEST_HOST:
-            logger.debug("429 不切换请求 IP: host={} 不是 {}".format(hostname or "unknown", self.SHOW_REQUEST_HOST))
-            return None
-
-        current_ip = record.get("custom_ip") or getattr(self, "_current_request_ip", None)
-        self._extend_request_ip_pool(self._split_request_ips(current_ip))
-        next_ip = self._pick_show_request_ip(current_ip)
-        if not next_ip:
-            logger.warning("429 后未找到可用的可切换请求 IP: host={} current_ip={}".format(hostname, current_ip or "未设置"))
-            return None
-
-        self._current_request_ip = next_ip
-        logger.warning("429 后切换请求 IP: host={} {} -> {}".format(hostname, current_ip or "未设置", next_ip))
-        return next_ip
-
-    def _record_rate_limit(self, method: str, logical_url: str, response: httpx.Response, actual_url: str = None, custom_ip: str = None, host_header: str = None):
-        try:
-            response.read()
-        except Exception:
-            pass
-        actual_url = actual_url or str(response.request.url if response.request else logical_url)
-        parsed = urlparse(str(logical_url))
-        endpoint = f"{parsed.netloc}{parsed.path}"
-        cdn_info = self._extract_cdn_info(response.headers)
-        self.rate_limit_events.append({"timestamp": time.time(), "method": method, "endpoint": endpoint, "provider": cdn_info["provider"], "zone": cdn_info["zone"]})
-        summary = self._rate_limit_summary()
-        record = {
-            "event": "http_429_rate_limit",
-            "local_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-            "epoch_ms": int(time.time() * 1000),
-            "method": method,
-            "endpoint": endpoint,
-            "logical_url": self._redact_url(logical_url),
-            "actual_url": self._redact_url(actual_url),
-            "query_keys": [key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)],
-            "status_code": response.status_code,
-            "reason_phrase": response.reason_phrase,
-            "retry_after": response.headers.get("Retry-After"),
-            "cdn": cdn_info,
-            "last_known_cdn": self.last_cdn_info,
-            "custom_ip": custom_ip,
-            "host_header": host_header,
-            "http_version": response.http_version,
-            "response_headers": self._safe_header_dict(response.headers),
-            "response_body_preview": response.text[:500],
-            "summary": summary,
-        }
-        self.a(record)
-        logger.warning("429限流诊断: {} endpoint={} cdn={}/{} retry_after={}".format(summary["classification"], endpoint, cdn_info["provider"], cdn_info["zone"], record["retry_after"]))
-        logger.debug("429限流诊断详情: " + json.dumps(record, ensure_ascii=False, sort_keys=True))
-        try:
-            os.makedirs("bhyg_logs", exist_ok=True)
-            file_name = time.strftime("429_diagnostics_%Y-%m-%d.jsonl", time.localtime())
-            with open(os.path.join("bhyg_logs", file_name), "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-        except Exception as e:
-            logger.debug(f"429诊断日志写入失败: {e}")
     def _gen_risk_header(self):
         uid = self.uid
         buvid = self.buvid
@@ -841,7 +557,7 @@ class BilibiliClient:
         except Exception as e:
             return {"code": -114514,"message": f"请求失败：{e}","data": None}
         if resp.status_code == 429:
-            self._record_rate_limit("GET", url, resp)
+            resp.read()
             return {"code": 429,"message": f"请求被限流：[{resp.status_code}]","data": None}
         if resp.status_code == 200:
             resp = resp.json()
@@ -875,33 +591,15 @@ class BilibiliClient:
 
     def post(self, url: str, **kwargs) -> httpx.Response:
         return_raw = kwargs.pop("raw", False)
-        logical_url = url
-        actual_url = url
-        custom_ip = None
-        host_header = None
-        configured_ip = kwargs.pop("ip", None)
-        self._extend_request_ip_pool(self._split_request_ips(configured_ip))
-        if getattr(self, "_current_request_ip", None) is None and self._request_ip_pool:
-            self._current_request_ip = self._request_ip_pool[0]
+        configured_ips = self._split_request_ips(kwargs.pop("ip", None))
+        configured_ip = configured_ips[0] if configured_ips else None
         try:
-            if "createV2" in url and (configured_ip or getattr(self, "_current_request_ip", None)):
-                configured_ips = self._split_request_ips(configured_ip)
-                if not getattr(self, "_current_request_ip", None):
-                    self._current_request_ip = self._pick_show_request_ip(preferred_ips=configured_ips)
-                elif not self._probe_show_request_ip(self._current_request_ip):
-                    self._current_request_ip = self._pick_show_request_ip(self._current_request_ip, configured_ips)
-                if not self._current_request_ip:
-                    return {"code": -114514,"message": "没有可用的下单 IP","data": None}
+            if "createV2" in url and configured_ip:
                 hostname = urlparse(url).hostname
-                custom_ip = self._current_request_ip
-                host_header = hostname
-                url = url.replace(hostname, custom_ip)
-                actual_url = url
+                url = url.replace(hostname, configured_ip)
                 headers = kwargs.pop("headers", {}) or {}
                 headers["Host"] = hostname
                 headers = httpx.Headers(headers)
-                logger.debug(f"Request headers: {headers}")
-                logger.debug(f"Request url: {url}")
                 resp = self.session.post(url, headers=headers, **kwargs)
                 self.clean_cookie()
             else:
@@ -909,15 +607,6 @@ class BilibiliClient:
                 self.clean_cookie()
         except Exception as e:
             return {"code": -114514,"message": f"请求失败：{e}","data": None}
-        if resp.status_code == 429:
-            self._record_rate_limit(
-                "POST",
-                logical_url,
-                resp,
-                actual_url=actual_url,
-                custom_ip=custom_ip,
-                host_header=host_header,
-            )
         if return_raw:
             return resp
         if resp.status_code == 200:
