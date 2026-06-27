@@ -26,7 +26,8 @@ from typing import final
 
 VERSION = "v1.13.1"
 
-BYPASS_412 = True
+# DedeUserID 扰动会导致登录态与真实账号不一致，默认关闭，仅保留实验开关。
+BYPASS_412 = False
 BYPASS_429 = True
 KFC_TIME_WARMUP_SECONDS = 3600
 
